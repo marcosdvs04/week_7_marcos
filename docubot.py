@@ -8,7 +8,72 @@ Core DocuBot class responsible for:
 """
 
 import os
+import re
 import glob
+
+# -----------------------------------------------------------
+# Text helpers used by indexing, scoring, and retrieval
+# -----------------------------------------------------------
+
+# Words that carry no meaning for search ("where is the ...").
+STOPWORDS = {
+    "a", "an", "the", "is", "are", "was", "be", "do", "does", "did", "i",
+    "you", "we", "it", "my", "our", "your", "to", "of", "in", "on", "for",
+    "and", "or", "by", "with", "from", "at", "as", "this", "that", "these",
+    "those", "there", "any", "what", "which", "where", "when", "how", "who",
+    "why", "can", "should", "will", "me", "about", "into", "get", "use",
+}
+
+# Extra points for each query term that appears in a section's heading.
+HEADING_BONUS = 0.5
+
+# Extra points when a route/path from the query (e.g. "/api/users") is
+# exactly the thing a section heading documents.
+EXACT_PATH_BONUS = 2
+
+
+def stem(word):
+    """Very small suffix stripper so 'generated'/'generation' and 'users'/'user' match."""
+    for suffix in ("ions", "ing", "ion", "ed", "s"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 4:
+            word = word[: -len(suffix)]
+            break
+    # 'stores' -> 'store' -> 'stor' so it matches 'stored' -> 'stor'
+    if word.endswith("e") and len(word) > 4:
+        word = word[:-1]
+    return word
+
+
+def tokenize(text):
+    """Lowercase, split on anything that is not a letter/digit/underscore, drop stopwords, stem."""
+    words = re.findall(r"[a-z0-9_]+", text.lower())
+    return [stem(w) for w in words if w not in STOPWORDS and len(w) > 1]
+
+
+def split_into_sections(text):
+    """
+    Split a markdown document into sections: each heading line starts a new
+    section and keeps its body with it. Sections with no real content are dropped.
+    """
+    sections, current = [], []
+    for line in text.splitlines():
+        if line.startswith("#") and current:
+            sections.append("\n".join(current).strip())
+            current = []
+        current.append(line)
+    if current:
+        sections.append("\n".join(current).strip())
+    # A lone heading (e.g. "## Tables") is not useful evidence.
+    return [s for s in sections if len(s.splitlines()) > 1]
+
+
+def min_score_for(query_terms):
+    """
+    Guardrail threshold. A section must match at least 2 distinct query terms
+    (or every term, for one-word queries). One incidental word overlap is
+    not evidence.
+    """
+    return min(2, len(query_terms))
 
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
@@ -50,21 +115,21 @@ class DocuBot:
 
     def build_index(self, documents):
         """
-        TODO (Phase 1):
-        Build a tiny inverted index mapping lowercase words to the documents
-        they appear in.
+        Build a tiny inverted index mapping normalized words to the documents
+        they appear in, e.g. {"token": ["API_REFERENCE.md", "AUTH.md"], ...}.
 
-        Example structure:
-        {
-            "token": ["AUTH.md", "API_REFERENCE.md"],
-            "database": ["DATABASE.md"]
-        }
-
-        Keep this simple: split on whitespace, lowercase tokens,
-        ignore punctuation if needed.
+        Also splits every document into sections (self.sections) so retrieval
+        can return small, focused snippets instead of whole files.
         """
         index = {}
-        # TODO: implement simple indexing
+        self.sections = []  # list of (filename, section_text)
+
+        for filename, text in documents:
+            for word in set(tokenize(text)):
+                index.setdefault(word, []).append(filename)
+            for section in split_into_sections(text):
+                self.sections.append((filename, section))
+
         return index
 
     # -----------------------------------------------------------
@@ -73,27 +138,61 @@ class DocuBot:
 
     def score_document(self, query, text):
         """
-        TODO (Phase 1):
-        Return a simple relevance score for how well the text matches the query.
-
-        Suggested baseline:
-        - Convert query into lowercase words
-        - Count how many appear in the text
-        - Return the count as the score
+        Relevance score = number of distinct query terms present in the text,
+        plus a bonus for each query term that appears in the section heading
+        (headings are a strong signal of what a section is about).
         """
-        # TODO: implement scoring
-        return 0
+        query_terms = set(tokenize(query))
+        if not query_terms:
+            return 0
+
+        text_terms = set(tokenize(text))
+        first_line = text.splitlines()[0] if text.strip() else ""
+        heading_terms = set(tokenize(first_line)) if first_line.startswith("#") else set()
+
+        matches = query_terms & text_terms
+        heading_bonus = HEADING_BONUS * len(query_terms & heading_terms)
+
+        # Paths like "/api/projects/<project_id>" should prefer the section
+        # whose heading names that exact route, not just a similar one.
+        path_bonus = 0
+        if first_line.startswith("#"):
+            heading_paths = set(re.findall(r"/\S+", first_line))
+            for path in re.findall(r"/\S+", query):
+                if path.rstrip("?.,").lower() in {p.lower() for p in heading_paths}:
+                    path_bonus = EXACT_PATH_BONUS
+
+        return len(matches) + heading_bonus + path_bonus
 
     def retrieve(self, query, top_k=3):
         """
-        TODO (Phase 1):
-        Use the index and scoring function to select top_k relevant document snippets.
+        Return up to top_k (filename, section_text) pairs, best first.
 
-        Return a list of (filename, text) sorted by score descending.
+        Steps:
+        1. Use the index to find candidate files containing any query term.
+        2. Score each section of those files.
+        3. Guardrail: drop sections that do not clear min_score_for(query).
+        4. Sort by score (ties: shorter section first) and keep top_k.
         """
-        results = []
-        # TODO: implement retrieval logic
-        return results[:top_k]
+        query_terms = set(tokenize(query))
+        if not query_terms:
+            return []
+
+        candidate_files = set()
+        for term in query_terms:
+            candidate_files.update(self.index.get(term, []))
+
+        threshold = min_score_for(query_terms)
+        scored = []
+        for filename, section in self.sections:
+            if filename not in candidate_files:
+                continue
+            score = self.score_document(query, section)
+            if score >= threshold:
+                scored.append((score, filename, section))
+
+        scored.sort(key=lambda item: (-item[0], len(item[2])))
+        return [(filename, section) for _, filename, section in scored[:top_k]]
 
     # -----------------------------------------------------------
     # Answering Modes
